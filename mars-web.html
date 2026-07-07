@@ -1,0 +1,1252 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>MARS Web — Meta Automated Review System</title>
+<!-- Tailwind CSS CDN -->
+<script src="https://cdn.tailwindcss.com"></script>
+<!-- React 18 UMD -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<!-- Babel Standalone (JSX 轉譯) — 釘選 v7：v8 的 preset-react 預設 automatic runtime 會產生 import 語句，無法直接在瀏覽器執行 -->
+<script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
+<style>
+  body { font-family: ui-sans-serif, system-ui, "Segoe UI", "Noto Sans TC", sans-serif; }
+  input[type=number]::-webkit-inner-spin-button { opacity: 0.3; }
+</style>
+</head>
+<body class="bg-slate-100 min-h-screen">
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useRef } = React;
+
+const MAX_OUTCOMES = 10;
+
+/* ================================================================
+   1. 數值函式庫
+   ================================================================ */
+function twoSidedP(z) {
+  const az = Math.abs(z);
+  const t = 1 / (1 + 0.2316419 * az);
+  const d = 0.3989422804014327 * Math.exp(-az * az / 2);
+  const upper = d * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+  return Math.min(1, 2 * upper);
+}
+function gammaln(x) {
+  const c = [76.18009172947146, -86.50532032941677, 24.01409824083091,
+             -1.231739572450155, 0.1208650973866179e-2, -0.5395239384953e-5];
+  let y = x, tmp = x + 5.5;
+  tmp -= (x + 0.5) * Math.log(tmp);
+  let ser = 1.000000000190015;
+  for (let j = 0; j < 6; j++) ser += c[j] / ++y;
+  return -tmp + Math.log(2.5066282746310005 * ser / x);
+}
+function gammp(a, x) {
+  if (x <= 0) return 0;
+  if (x < a + 1) {
+    let ap = a, s = 1 / a, del = s;
+    for (let n = 1; n < 300; n++) { ap++; del *= x / ap; s += del; if (Math.abs(del) < Math.abs(s) * 1e-13) break; }
+    return s * Math.exp(-x + a * Math.log(x) - gammaln(a));
+  }
+  let b = x + 1 - a, c = 1e30, d = 1 / b, h = d;
+  for (let i = 1; i < 300; i++) {
+    const an = -i * (i - a); b += 2;
+    d = an * d + b; if (Math.abs(d) < 1e-30) d = 1e-30;
+    c = b + an / c; if (Math.abs(c) < 1e-30) c = 1e-30;
+    d = 1 / d; const del = d * c; h *= del;
+    if (Math.abs(del - 1) < 1e-13) break;
+  }
+  return 1 - Math.exp(-x + a * Math.log(x) - gammaln(a)) * h;
+}
+const chiSqP = (q, df) => (df <= 0 || q <= 0) ? 1 : Math.max(0, 1 - gammp(df / 2, q / 2));
+const Z95 = 1.959963985;
+const sum = arr => arr.reduce((a, b) => a + b, 0);
+
+/* ================================================================
+   2. 核心統計引擎
+   ================================================================ */
+function heterogeneity(ests, vs) {
+  const k = ests.length;
+  const w = vs.map(v => 1 / v);
+  const sw = sum(w);
+  const estIV = sum(ests.map((e, i) => w[i] * e)) / sw;
+  const Q = sum(ests.map((e, i) => w[i] * (e - estIV) ** 2));
+  const df = k - 1;
+  const C = sw - sum(w.map(x => x * x)) / sw;
+  const tau2 = (df > 0 && C > 0) ? Math.max(0, (Q - df) / C) : 0;
+  const i2 = (df > 0 && Q > df) ? ((Q - df) / Q) * 100 : 0;
+  return { Q, df, pQ: df > 0 ? chiSqP(Q, df) : 1, i2, tau2 };
+}
+function poolInvVar(rows, model) {
+  const het = heterogeneity(rows.map(r => r.est), rows.map(r => r.v));
+  const w = model === 'random' ? rows.map(r => 1 / (r.v + het.tau2)) : rows.map(r => 1 / r.v);
+  const sw = sum(w);
+  const est = sum(rows.map((r, i) => w[i] * r.est)) / sw;
+  const se = Math.sqrt(1 / sw);
+  const z = est / se;
+  return { est, se, lo: est - Z95 * se, hi: est + Z95 * se, z, p: twoSidedP(z), het, w, sw, k: rows.length };
+}
+function poolDich(rows, model, measure) {
+  if (model === 'random') return poolInvVar(rows, 'random');
+  const het = heterogeneity(rows.map(r => r.est), rows.map(r => r.v));
+  let est, v, w;
+  if (measure === 'RR') {
+    const R = rows.map(r => r.a * r.n2 / r.N), S = rows.map(r => r.c * r.n1 / r.N);
+    const sR = sum(R), sS = sum(S);
+    est = Math.log(sR / sS);
+    const sP = sum(rows.map(r => (r.n1 * r.n2 * (r.a + r.c) - r.a * r.c * r.N) / (r.N * r.N)));
+    v = sP / (sR * sS); w = S;
+  } else if (measure === 'OR') {
+    const R = rows.map(r => r.a * r.d / r.N), S = rows.map(r => r.b * r.c / r.N);
+    const P = rows.map(r => (r.a + r.d) / r.N), Qc = rows.map(r => (r.b + r.c) / r.N);
+    const sR = sum(R), sS = sum(S);
+    est = Math.log(sR / sS);
+    v = sum(P.map((p, i) => p * R[i])) / (2 * sR * sR)
+      + sum(P.map((p, i) => p * S[i] + Qc[i] * R[i])) / (2 * sR * sS)
+      + sum(Qc.map((q, i) => q * S[i])) / (2 * sS * sS);
+    w = S;
+  } else {
+    const wr = rows.map(r => r.n1 * r.n2 / r.N);
+    const sw = sum(wr);
+    est = sum(rows.map((r, i) => wr[i] * (r.a / r.n1 - r.c / r.n2))) / sw;
+    const J = sum(rows.map(r => (r.a * r.b * r.n2 ** 3 + r.c * r.d * r.n1 ** 3) / (r.n1 * r.n2 * r.N * r.N)));
+    v = J / (sw * sw); w = wr;
+  }
+  if (!Number.isFinite(est) || !(v > 0)) return poolInvVar(rows, 'fixed');
+  const se = Math.sqrt(v), z = est / se;
+  return { est, se, lo: est - Z95 * se, hi: est + Z95 * se, z, p: twoSidedP(z), het, w, sw: sum(w), k: rows.length };
+}
+function computeRowsCont(studies) {
+  return studies.map(s => {
+    const n1 = parseFloat(s.n1), m1 = parseFloat(s.m1), sd1 = parseFloat(s.sd1);
+    const n2 = parseFloat(s.n2), m2 = parseFloat(s.m2), sd2 = parseFloat(s.sd2);
+    const ok = n1 > 0 && n2 > 0 && sd1 > 0 && sd2 > 0 && Number.isFinite(m1) && Number.isFinite(m2);
+    if (!ok) return { id: s.id, name: s.name, ok: false, excluded: false };
+    const est = m1 - m2, v = (sd1 * sd1) / n1 + (sd2 * sd2) / n2, se = Math.sqrt(v);
+    return { id: s.id, name: s.name, ok: true, excluded: false, n1, n2, m1, sd1, m2, sd2, est, v, se, lo: est - Z95 * se, hi: est + Z95 * se };
+  });
+}
+function computeRowsDich(studies, measure) {
+  const isRatio = measure !== 'RD';
+  return studies.map(s => {
+    const e1 = parseFloat(s.e1), n1 = parseFloat(s.n1), e2 = parseFloat(s.e2), n2 = parseFloat(s.n2);
+    const ok = n1 > 0 && n2 > 0 && e1 >= 0 && e2 >= 0 && e1 <= n1 && e2 <= n2 && Number.isFinite(e1) && Number.isFinite(e2);
+    const base = { id: s.id, name: s.name };
+    if (!ok) return { ...base, ok: false, excluded: false };
+    const a = e1, b = n1 - e1, c = e2, d = n2 - e2, N = n1 + n2;
+    const excluded = isRatio && ((a === 0 && c === 0) || (b === 0 && d === 0));
+    if (excluded) return { ...base, ok: true, excluded: true, a, b, c, d, N, n1, n2, e1, e2 };
+    let est, v;
+    if (measure === 'RD') {
+      est = a / n1 - c / n2;
+      v = (a * b) / n1 ** 3 + (c * d) / n2 ** 3;
+      if (v === 0) v = ((a + 0.5) * (b + 0.5)) / (n1 + 1) ** 3 + ((c + 0.5) * (d + 0.5)) / (n2 + 1) ** 3;
+    } else {
+      const zc = (a === 0 || b === 0 || c === 0 || d === 0) ? 0.5 : 0;
+      const az = a + zc, bz = b + zc, cz = c + zc, dz = d + zc, n1z = n1 + 2 * zc, n2z = n2 + 2 * zc;
+      if (measure === 'RR') { est = Math.log((az / n1z) / (cz / n2z)); v = 1 / az - 1 / n1z + 1 / cz - 1 / n2z; }
+      else { est = Math.log((az * dz) / (bz * cz)); v = 1 / az + 1 / bz + 1 / cz + 1 / dz; }
+    }
+    const se = Math.sqrt(v);
+    return { ...base, ok: true, excluded: false, a, b, c, d, N, n1, n2, e1, e2, est, v, se, lo: est - Z95 * se, hi: est + Z95 * se };
+  });
+}
+
+/* ---------------------------------------------------------------
+   3. 分析主流程
+   --------------------------------------------------------------- */
+const UNCLASSIFIED = '未分類';
+function analyzeOverall(allRows, model, poolFn) {
+  const includedRaw = allRows.filter(r => r.ok && !r.excluded && Number.isFinite(r.est));
+  const k = includedRaw.length;
+  if (k === 0) {
+    return { rows: allRows.map(r => ({ ...r, weightPct: null })), included: [], k: 0, overall: null,
+             totalN1: 0, totalN2: 0, totalE1: 0, totalE2: 0 };
+  }
+  const overall = poolFn(includedRaw, model);
+  const weightById = {};
+  includedRaw.forEach((r, i) => { weightById[r.id] = (overall.w[i] / overall.sw) * 100; });
+  const included = includedRaw.map(r => ({ ...r, weightPct: weightById[r.id] }));
+  return {
+    rows: allRows.map(r => ({ ...r, weightPct: (r.id in weightById) ? weightById[r.id] : null })),
+    included, k, overall,
+    totalN1: sum(included.map(r => r.n1 || 0)), totalN2: sum(included.map(r => r.n2 || 0)),
+    totalE1: sum(included.map(r => (r.e1 !== undefined ? +r.e1 || 0 : 0))),
+    totalE2: sum(included.map(r => (r.e2 !== undefined ? +r.e2 || 0 : 0))),
+  };
+}
+function analyzeGroups(included, model, poolFn, categories, assign) {
+  const order = [...categories.filter(c => c !== UNCLASSIFIED), UNCLASSIFIED];
+  const map = new Map(order.map(c => [c, []]));
+  included.forEach(r => {
+    const key = assign[r.id] && assign[r.id] !== UNCLASSIFIED ? assign[r.id] : UNCLASSIFIED;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(r);
+  });
+  const groups = [...map.entries()].filter(([, rs]) => rs.length > 0).map(([name, rows]) => ({
+    name, rows, pooled: poolFn(rows, model), weightPct: sum(rows.map(r => r.weightPct)),
+  }));
+  const valid = groups.filter(g => g.pooled && Number.isFinite(g.pooled.est) && g.pooled.se > 0);
+  let between = null;
+  if (valid.length >= 2) {
+    const wS = valid.map(g => 1 / g.pooled.se ** 2);
+    const swS = sum(wS);
+    const Mv = sum(valid.map((g, i) => wS[i] * g.pooled.est)) / swS;
+    const Q = sum(valid.map((g, i) => wS[i] * (g.pooled.est - Mv) ** 2));
+    const df = valid.length - 1;
+    const i2 = Q > df ? ((Q - df) / Q) * 100 : 0;
+    between = { Q, df, p: chiSqP(Q, df), i2, nGroups: valid.length };
+  }
+  return { groups, between };
+}
+
+/* ================================================================
+   4. 格式化 + 效應量資訊
+   ================================================================ */
+const f2 = x => (Number.isFinite(x) ? x.toFixed(2) : '—');
+const fmtCI = (lo, hi) => `[${f2(lo)}, ${f2(hi)}]`;
+// 座標軸「漂亮」刻度間距（1-2-5 × 10^n）
+function niceStep(range, n) {
+  if (!(range > 0)) return 1;
+  const raw = range / n, mag = Math.pow(10, Math.floor(Math.log10(raw))), norm = raw / mag;
+  const s = norm < 1.5 ? 1 : norm < 3 ? 2 : norm < 7 ? 5 : 10;
+  return s * mag;
+}
+const fmtNum = v => {
+  const a = Math.abs(v);
+  if (a < 1e-9) return '0';
+  if (a >= 100) return String(Math.round(v));
+  if (a >= 10) return v.toFixed(1);
+  return v.toFixed(2);
+};
+const fmtP = p => {
+  if (!Number.isFinite(p)) return '—';
+  if (p < 0.00001) return 'P < 0.00001';
+  if (p < 0.001) return 'P = ' + p.toFixed(5);
+  return 'P = ' + p.toFixed(p < 0.1 ? 3 : 2);
+};
+const MEASURE_INFO = {
+  MD: { name: 'Mean Difference', zh: '平均差', method: 'IV',  log: false },
+  RR: { name: 'Risk Ratio',      zh: '風險比', method: 'M-H', log: true  },
+  OR: { name: 'Odds Ratio',      zh: '勝算比', method: 'M-H', log: true  },
+  RD: { name: 'Risk Difference', zh: '風險差', method: 'M-H', log: false },
+};
+const hetText = het => het.df <= 0
+  ? 'Heterogeneity: Not applicable'
+  : `Heterogeneity: Tau² = ${het.tau2.toFixed(2)}; Chi² = ${het.Q.toFixed(2)}, df = ${het.df} (${fmtP(het.pQ)}); I² = ${het.i2.toFixed(0)}%`;
+
+/* ================================================================
+   5. 森林圖下載 (SVG / PNG)
+   ================================================================ */
+function downloadBlob(blob, filename) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+function svgToString(svgEl) {
+  const vb = svgEl.viewBox.baseVal;
+  const clone = svgEl.cloneNode(true);
+  clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+  clone.setAttribute('width', vb.width);
+  clone.setAttribute('height', vb.height);
+  clone.setAttribute('style', 'font-family:ui-sans-serif,system-ui,Segoe UI,Noto Sans TC,sans-serif;background:#ffffff');
+  return new XMLSerializer().serializeToString(clone);
+}
+const safeName = t => (t || 'forest-plot').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 60);
+function downloadSVG(svgEl, title) {
+  downloadBlob(new Blob([svgToString(svgEl)], { type: 'image/svg+xml;charset=utf-8' }), safeName(title) + '.svg');
+}
+function downloadPNG(svgEl, title, scale = 2) {
+  const vb = svgEl.viewBox.baseVal;
+  const url = URL.createObjectURL(new Blob([svgToString(svgEl)], { type: 'image/svg+xml;charset=utf-8' }));
+  const img = new Image();
+  img.onload = () => {
+    const c = document.createElement('canvas');
+    c.width = vb.width * scale; c.height = vb.height * scale;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, c.width, c.height);
+    ctx.drawImage(img, 0, 0, c.width, c.height);
+    c.toBlob(b => downloadBlob(b, safeName(title) + '.png'), 'image/png');
+    URL.revokeObjectURL(url);
+  };
+  img.src = url;
+}
+function DownloadButtons({ svgRef, title }) {
+  const btn = "inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-lg border transition-colors";
+  const dl = <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>;
+  return (
+    <div className="flex gap-1.5">
+      <button className={`${btn} text-slate-600 bg-white border-slate-300 hover:bg-slate-50`}
+        onClick={() => svgRef.current && downloadSVG(svgRef.current, title)}>{dl} SVG</button>
+      <button className={`${btn} text-white bg-blue-600 border-blue-600 hover:bg-blue-700`}
+        onClick={() => svgRef.current && downloadPNG(svgRef.current, title)}>{dl} PNG</button>
+    </div>
+  );
+}
+
+/* ================================================================
+   6. 圖標
+   ================================================================ */
+const IconPlus = () => (<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M12 5v14M5 12h14"/></svg>);
+const IconTrash = () => (<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6M14 11v6"/></svg>);
+const IconX = () => (<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>);
+const IconChevron = () => (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m9 18 6-6-6-6"/></svg>);
+const IconFolder = () => (<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/></svg>);
+const IconChart = () => (<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18"/><path d="M18 17V9M13 17V5M8 17v-3"/></svg>);
+const IconBack = () => (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m15 18-6-6 6-6"/></svg>);
+
+/* ================================================================
+   7. 森林圖 (SVG)
+   ================================================================ */
+function ForestPlot({ title, included, groups, overall, between, model, measure, expLabel, ctrlLabel, svgRef }) {
+  const info = MEASURE_INFO[measure];
+  const isLog = info.log;
+  const isCont = measure === 'MD';
+  const disp = v => (isLog ? Math.exp(v) : v);
+  if (!overall || included.length === 0) {
+    return <div className="text-slate-400 text-sm py-10 text-center">請於數據輸入表格填入至少一筆有效研究，即可繪製森林圖</div>;
+  }
+  const hasGroups = !!groups;
+  const eL = expLabel || 'Experimental', cL = ctrlLabel || 'Control';
+  const fx = v => (Number.isFinite(v) ? (Number.isInteger(v) ? String(v) : v.toFixed(2)) : '');
+
+  // 版面 X 座標
+  const W = 1010, nameX = 10, studyX = hasGroups ? 24 : 10;
+  // 各研究原始數據欄位（右對齊；rx = 該欄文字右緣）
+  const colDefs = isCont ? [
+    { rx: 175, h: 'Mean',  gl: 'exp',  get: r => fx(r.m1) },
+    { rx: 213, h: 'SD',    gl: 'exp',  get: r => fx(r.sd1) },
+    { rx: 251, h: 'Total', gl: 'exp',  get: r => r.n1, sk: 'n1' },
+    { rx: 312, h: 'Mean',  gl: 'ctrl', get: r => fx(r.m2) },
+    { rx: 350, h: 'SD',    gl: 'ctrl', get: r => fx(r.sd2) },
+    { rx: 388, h: 'Total', gl: 'ctrl', get: r => r.n2, sk: 'n2' },
+  ] : [
+    { rx: 195, h: 'Events', gl: 'exp',  get: r => r.e1, sk: 'e1' },
+    { rx: 251, h: 'Total',  gl: 'exp',  get: r => r.n1, sk: 'n1' },
+    { rx: 332, h: 'Events', gl: 'ctrl', get: r => r.e2, sk: 'e2' },
+    { rx: 388, h: 'Total',  gl: 'ctrl', get: r => r.n2, sk: 'n2' },
+  ];
+  const sumCols = colDefs.filter(c => c.sk);
+  const spanC = rx => { const l = Math.min(...rx) - 30, r = Math.max(...rx); return { l, r, c: (l + r) / 2 }; };
+  const expSpan = spanC(colDefs.filter(c => c.gl === 'exp').map(c => c.rx));
+  const ctrlSpan = spanC(colDefs.filter(c => c.gl === 'ctrl').map(c => c.rx));
+  const sumOf = (rows, key) => sum(rows.map(r => +r[key] || 0));
+
+  const PX0 = 455, PX1 = 665, weightR = 748, ciX = 762;
+  const effHeadCenter = (ciX + W) / 2;
+
+  let maxAbs = 1e-9;
+  included.forEach(r => { maxAbs = Math.max(maxAbs, Math.abs(r.lo), Math.abs(r.hi)); });
+  if (hasGroups) groups.forEach(g => { if (g.pooled) maxAbs = Math.max(maxAbs, Math.abs(g.pooled.lo), Math.abs(g.pooled.hi)); });
+  maxAbs = Math.max(maxAbs, Math.abs(overall.lo), Math.abs(overall.hi));
+
+  let M, ticks, tickLabels;
+  if (isLog) {
+    const sets = [
+      { X: 2, t: [0.5, 1, 2] }, { X: 5, t: [0.2, 0.5, 1, 2, 5] },
+      { X: 10, t: [0.1, 0.5, 1, 2, 10] }, { X: 100, t: [0.01, 0.1, 1, 10, 100] },
+      { X: 1000, t: [0.001, 0.1, 1, 10, 1000] },
+    ];
+    const chosen = sets.find(s => Math.log(s.X) >= maxAbs) || sets[sets.length - 1];
+    M = Math.log(chosen.X); ticks = chosen.t.map(Math.log); tickLabels = chosen.t.map(String);
+  } else {
+    const pow = Math.pow(10, Math.floor(Math.log10(maxAbs)));
+    M = [1, 2, 2.5, 5, 10].map(m => m * pow).find(m => m >= maxAbs) || maxAbs;
+    ticks = [-M, -M / 2, 0, M / 2, M];
+    tickLabels = ticks.map(t => Math.abs(t) >= 10 ? String(Math.round(t)) : String(parseFloat(t.toPrecision(3))));
+  }
+  const xOf = v => PX0 + ((Math.max(-M, Math.min(M, v)) + M) / (2 * M)) * (PX1 - PX0);
+  const maxW = Math.max(...included.map(r => r.weightPct || 0), 1e-9);
+  const sideOf = wp => Math.max(4, 15 * Math.sqrt((wp || 0) / maxW));
+  const ciText = o => `${f2(disp(o.est))} ${fmtCI(disp(o.lo), disp(o.hi))}`;
+
+  const T0 = title ? 24 : 0;
+  const grpY = 15 + T0, colY = 32 + T0, headLineY = 38 + T0, topY = 54 + T0;
+  const ghH = 24, stH = 30, subH = 26, lineH = 15, gap = 14;
+  const items = [];
+  let y = topY;
+  if (hasGroups) {
+    groups.forEach(g => {
+      items.push({ k: 'ghead', bandY: y - 2, textY: y + 15, g });
+      y += ghH;
+      g.rows.forEach(r => { items.push({ k: 'study', cy: y + stH / 2, r }); y += stH; });
+      items.push({ k: 'subtotal', cy: y + 13, g }); y += subH;
+      items.push({ k: 'subhet', y1: y + 2, y2: y + 2 + lineH, g }); y += 2 * lineH + 2;
+      y += gap;
+    });
+  } else {
+    included.forEach(r => { items.push({ k: 'study', cy: y + stH / 2, r }); y += stH; });
+    y += 4;
+  }
+  items.push({ k: 'total', cy: y + 13 }); y += subH;
+  const axisY = y + 8;
+  const overallHetY = axisY + 48;
+  const nBottom = hasGroups ? 3 : 2;
+  const H = overallHetY + nBottom * lineH + 6;
+
+  // 加總列（Subtotal / Total）的原始數據欄位
+  const SummaryCols = ({ rows, y, weight }) => (
+    <>
+      {sumCols.map((c, i) => <text key={i} x={c.rx} y={y} fontSize="11.5" fontWeight="600" fill="#0f172a" textAnchor="end">{sumOf(rows, c.sk)}</text>)}
+    </>
+  );
+
+  return (
+    <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxWidth: W }} xmlns="http://www.w3.org/2000/svg">
+      <rect x="0" y="0" width={W} height={H} fill="#ffffff" />
+      {title && <text x={nameX} y="16" fontSize="13.5" fontWeight="700" fill="#0f172a">{title}</text>}
+
+      {/* 群組標題列（實驗組 / 對照組 / 效應量） */}
+      <text x={expSpan.c} y={grpY} fontSize="12" fontWeight="700" fill="#334155" textAnchor="middle">{eL}</text>
+      <line x1={expSpan.l} y1={grpY + 4} x2={expSpan.r} y2={grpY + 4} stroke="#cbd5e1" strokeWidth="1" />
+      <text x={ctrlSpan.c} y={grpY} fontSize="12" fontWeight="700" fill="#334155" textAnchor="middle">{cL}</text>
+      <line x1={ctrlSpan.l} y1={grpY + 4} x2={ctrlSpan.r} y2={grpY + 4} stroke="#cbd5e1" strokeWidth="1" />
+      <text x={effHeadCenter} y={grpY} fontSize="12" fontWeight="700" fill="#334155" textAnchor="middle">{info.name}</text>
+
+      {/* 欄位標頭列 */}
+      <text x={nameX} y={colY} fontSize="12" fontWeight="700" fill="#334155">{hasGroups ? 'Study or Subgroup' : 'Study'}</text>
+      {colDefs.map((c, i) => <text key={'h' + i} x={c.rx} y={colY} fontSize="11.5" fontWeight="700" fill="#334155" textAnchor="end">{c.h}</text>)}
+      <text x={weightR} y={colY} fontSize="12" fontWeight="700" fill="#334155" textAnchor="end">Weight</text>
+      <text x={ciX} y={colY} fontSize="12" fontWeight="700" fill="#334155">{measure} ({info.method}, {model === 'random' ? 'Random' : 'Fixed'}, 95% CI)</text>
+      <line x1="0" y1={headLineY} x2={W} y2={headLineY} stroke="#cbd5e1" strokeWidth="1" />
+
+      {/* 次組別標題底色帶 */}
+      {hasGroups && items.filter(it => it.k === 'ghead').map((it, i) => (
+        <rect key={'b' + i} x="0" y={it.bandY} width={W} height={ghH} fill="#f1f5f9" />
+      ))}
+
+      {/* 中央無效線 */}
+      <line x1={xOf(0)} y1={topY} x2={xOf(0)} y2={axisY} stroke="#475569" strokeWidth="1.2" />
+
+      {items.map((it, idx) => {
+        if (it.k === 'ghead') return <text key={idx} x={nameX} y={it.textY} fontSize="12" fontWeight="700" fill="#1e293b">{it.g.name}（{it.g.rows.length} studies）</text>;
+        if (it.k === 'study') {
+          const r = it.r, s = sideOf(r.weightPct), cy = it.cy;
+          return (
+            <g key={idx}>
+              <text x={studyX} y={cy + 4} fontSize="12" fill="#0f172a">{r.name || '(未命名)'}</text>
+              {colDefs.map((c, i) => <text key={i} x={c.rx} y={cy + 4} fontSize="11.5" fill="#334155" textAnchor="end">{c.get(r)}</text>)}
+              <text x={weightR} y={cy + 4} fontSize="11.5" fill="#0f172a" textAnchor="end">{r.weightPct.toFixed(1)}%</text>
+              <line x1={xOf(r.lo)} y1={cy} x2={xOf(r.hi)} y2={cy} stroke="#1e3a8a" strokeWidth="1.3" />
+              <line x1={xOf(r.lo)} y1={cy - 4} x2={xOf(r.lo)} y2={cy + 4} stroke="#1e3a8a" strokeWidth="1.3" />
+              <line x1={xOf(r.hi)} y1={cy - 4} x2={xOf(r.hi)} y2={cy + 4} stroke="#1e3a8a" strokeWidth="1.3" />
+              <rect x={xOf(r.est) - s / 2} y={cy - s / 2} width={s} height={s} fill="#2563eb" />
+              <text x={ciX} y={cy + 4} fontSize="11.5" fill="#0f172a">{ciText(r)}</text>
+            </g>
+          );
+        }
+        if (it.k === 'subtotal') {
+          const p = it.g.pooled, cy = it.cy;
+          return (
+            <g key={idx}>
+              <text x={studyX} y={cy + 4} fontSize="12" fontWeight="600" fill="#0f172a">Subtotal (95% CI)</text>
+              <SummaryCols rows={it.g.rows} y={cy + 4} />
+              <text x={weightR} y={cy + 4} fontSize="11.5" fontWeight="600" fill="#0f172a" textAnchor="end">{it.g.weightPct.toFixed(1)}%</text>
+              <polygon points={`${xOf(p.lo)},${cy} ${xOf(p.est)},${cy - 7} ${xOf(p.hi)},${cy} ${xOf(p.est)},${cy + 7}`} fill="#1d4ed8" />
+              <text x={ciX} y={cy + 4} fontSize="11.5" fontWeight="600" fill="#0f172a">{ciText(p)}</text>
+            </g>
+          );
+        }
+        if (it.k === 'subhet') {
+          const p = it.g.pooled;
+          return (
+            <g key={idx}>
+              <text x={studyX} y={it.y1} fontSize="10.5" fill="#64748b">{hetText(p.het)}</text>
+              <text x={studyX} y={it.y2} fontSize="10.5" fill="#64748b">Test for overall effect: Z = {Math.abs(p.z).toFixed(2)} ({fmtP(p.p)})</text>
+            </g>
+          );
+        }
+        const cy = it.cy;
+        return (
+          <g key={idx}>
+            <line x1="0" y1={cy - 15} x2={W} y2={cy - 15} stroke="#cbd5e1" strokeWidth="1" />
+            <text x={nameX} y={cy + 4} fontSize="12" fontWeight="700" fill="#0f172a">Total (95% CI)</text>
+            <SummaryCols rows={included} y={cy + 4} />
+            <text x={weightR} y={cy + 4} fontSize="11.5" fontWeight="700" fill="#0f172a" textAnchor="end">100.0%</text>
+            <polygon points={`${xOf(overall.lo)},${cy} ${xOf(overall.est)},${cy - 9} ${xOf(overall.hi)},${cy} ${xOf(overall.est)},${cy + 9}`} fill="#0f172a" />
+            <text x={ciX} y={cy + 4} fontSize="11.5" fontWeight="700" fill="#0f172a">{ciText(overall)}</text>
+          </g>
+        );
+      })}
+
+      <line x1={PX0} y1={axisY} x2={PX1} y2={axisY} stroke="#334155" strokeWidth="1.2" />
+      {ticks.map((t, i) => (
+        <g key={'t' + i}>
+          <line x1={xOf(t)} y1={axisY} x2={xOf(t)} y2={axisY + 5} stroke="#334155" strokeWidth="1.2" />
+          <text x={xOf(t)} y={axisY + 18} fontSize="11" fill="#334155" textAnchor="middle">{tickLabels[i]}</text>
+        </g>
+      ))}
+      <text x={xOf(-M / 2)} y={axisY + 33} fontSize="11" fill="#64748b" textAnchor="middle">Favours {eL}</text>
+      <text x={xOf(M / 2)} y={axisY + 33} fontSize="11" fill="#64748b" textAnchor="middle">Favours {cL}</text>
+      <text x={nameX} y={overallHetY} fontSize="11" fill="#334155" fontWeight="600">{hetText(overall.het)}</text>
+      <text x={nameX} y={overallHetY + lineH} fontSize="11" fill="#334155" fontWeight="600">Test for overall effect: Z = {Math.abs(overall.z).toFixed(2)} ({fmtP(overall.p)})</text>
+      {hasGroups && (
+        <text x={nameX} y={overallHetY + 2 * lineH} fontSize="11" fill="#7c2d12" fontWeight="700">
+          {between ? `Test for subgroup differences: Chi² = ${between.Q.toFixed(2)}, df = ${between.df} (${fmtP(between.p)}); I² = ${between.i2.toFixed(1)}%`
+                   : 'Test for subgroup differences: 需 ≥ 2 個有效次組別'}
+        </text>
+      )}
+    </svg>
+  );
+}
+
+/* ================================================================
+   7b. 漏斗圖 (SVG Funnel Plot) — 發表偏誤診斷
+   X 軸：效應量（RR/OR 為 log 尺度）；Y 軸：SE（倒置，0 在頂）
+   中央虛線＝合併效應；兩側斜線＝偽 95% 信賴漏斗
+   ================================================================ */
+function FunnelPlot({ title, included, overall, measure, expLabel, ctrlLabel, svgRef }) {
+  const info = MEASURE_INFO[measure];
+  const isLog = info.log;
+  const disp = v => (isLog ? Math.exp(v) : v);
+  const valid = (included || []).filter(r => Number.isFinite(r.est) && r.se > 0);
+  if (!overall || valid.length < 2) {
+    return <div className="text-slate-400 text-sm py-10 text-center">需至少 2 筆有效研究才能繪製漏斗圖（Cochrane 建議 ≥ 10 篇研究方具判讀價值）</div>;
+  }
+  const pooled = overall.est;
+  const zc = Z95;
+
+  // Y（SE）軸
+  const seMaxData = Math.max(...valid.map(r => r.se));
+  const stepY = niceStep(seMaxData, 4);
+  const seAxisMax = Math.max(Math.ceil(seMaxData / stepY) * stepY, stepY);
+
+  // X（效應量）軸範圍：同時容納漏斗底寬與所有研究點
+  const funnelHalf = zc * seAxisMax;
+  let xHalf = funnelHalf;
+  valid.forEach(r => { xHalf = Math.max(xHalf, Math.abs(r.est - pooled)); });
+  xHalf *= 1.12;
+  const xMin = pooled - xHalf, xMax = pooled + xHalf;
+
+  // 版面
+  const W = 640, T0 = title ? 24 : 0;
+  const xLeft = 82, xRight = 600;
+  const yTop = 46 + T0, yBot = yTop + 320;
+  const H = yBot + 66;
+  const xOf = v => xLeft + ((v - xMin) / (xMax - xMin)) * (xRight - xLeft);
+  const yOf = se => yTop + (se / seAxisMax) * (yBot - yTop);
+
+  // X 刻度
+  let xticks = [];
+  if (isLog) {
+    const cand = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
+    xticks = cand.filter(r => Math.log(r) >= xMin && Math.log(r) <= xMax).map(r => ({ pos: Math.log(r), label: String(r) }));
+  } else {
+    const stepX = niceStep(xMax - xMin, 4);
+    for (let v = Math.ceil(xMin / stepX) * stepX; v <= xMax + 1e-9; v += stepX) {
+      const val = Math.abs(v) < 1e-9 ? 0 : v;
+      xticks.push({ pos: val, label: fmtNum(val) });
+    }
+  }
+  // Y 刻度（SE：0 → seAxisMax，由上往下）
+  const yticks = [];
+  for (let s = 0; s <= seAxisMax + 1e-9; s += stepY) yticks.push(+s.toFixed(10));
+
+  const yLabel = isLog ? `SE(log[${measure}])` : `SE(${measure})`;
+  const apexX = xOf(pooled);
+  const blX = xOf(pooled - funnelHalf), brX = xOf(pooled + funnelHalf);
+
+  return (
+    <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxWidth: W }} xmlns="http://www.w3.org/2000/svg">
+      <rect x="0" y="0" width={W} height={H} fill="#ffffff" />
+      {title && <text x="10" y="16" fontSize="13.5" fontWeight="700" fill="#0f172a">{title}</text>}
+
+      {/* 偽 95% 信賴漏斗（淺灰填充 + 虛線邊） */}
+      <polygon points={`${apexX},${yTop} ${blX},${yBot} ${brX},${yBot}`} fill="#f1f5f9" />
+      <line x1={apexX} y1={yTop} x2={blX} y2={yBot} stroke="#94a3b8" strokeWidth="1" strokeDasharray="4 3" />
+      <line x1={apexX} y1={yTop} x2={brX} y2={yBot} stroke="#94a3b8" strokeWidth="1" strokeDasharray="4 3" />
+      {/* 合併效應中央虛線 */}
+      <line x1={apexX} y1={yTop} x2={apexX} y2={yBot} stroke="#475569" strokeWidth="1.1" strokeDasharray="5 3" />
+
+      {/* Y 軸（左）+ 刻度（SE 倒置） */}
+      <line x1={xLeft} y1={yTop} x2={xLeft} y2={yBot} stroke="#334155" strokeWidth="1.2" />
+      {yticks.map((s, i) => (
+        <g key={'y' + i}>
+          <line x1={xLeft - 5} y1={yOf(s)} x2={xLeft} y2={yOf(s)} stroke="#334155" strokeWidth="1" />
+          <line x1={xLeft} y1={yOf(s)} x2={xRight} y2={yOf(s)} stroke="#eef2f6" strokeWidth="1" />
+          <text x={xLeft - 8} y={yOf(s) + 4} fontSize="10.5" fill="#475569" textAnchor="end">{s.toFixed(stepY < 0.1 ? 3 : 2)}</text>
+        </g>
+      ))}
+      <text transform={`translate(22 ${(yTop + yBot) / 2}) rotate(-90)`} fontSize="12" fontWeight="600" fill="#334155" textAnchor="middle">{yLabel}</text>
+
+      {/* X 軸（底，位於 SE=0 頂端亦畫一條輔助線） */}
+      <line x1={xLeft} y1={yBot} x2={xRight} y2={yBot} stroke="#334155" strokeWidth="1.2" />
+      {xticks.map((t, i) => (
+        <g key={'x' + i}>
+          <line x1={xOf(t.pos)} y1={yBot} x2={xOf(t.pos)} y2={yBot + 5} stroke="#334155" strokeWidth="1" />
+          <text x={xOf(t.pos)} y={yBot + 18} fontSize="10.5" fill="#475569" textAnchor="middle">{t.label}</text>
+        </g>
+      ))}
+      <text x={(xLeft + xRight) / 2} y={yBot + 36} fontSize="12" fontWeight="600" fill="#334155" textAnchor="middle">{info.name}{isLog ? '' : ''}</text>
+
+      {/* 研究點（空心圓） */}
+      {valid.map((r, i) => (
+        <circle key={'p' + i} cx={xOf(r.est)} cy={yOf(r.se)} r="4" fill="#ffffff" stroke="#1d4ed8" strokeWidth="1.5" />
+      ))}
+
+      {/* 方向提示 */}
+      <text x={xLeft + 4} y={yTop - 6} fontSize="10" fill="#94a3b8">← Favours {expLabel || 'Experimental'}</text>
+      <text x={xRight - 4} y={yTop - 6} fontSize="10" fill="#94a3b8" textAnchor="end">Favours {ctrlLabel || 'Control'} →</text>
+    </svg>
+  );
+}
+
+/* ================================================================
+   8. 輸入元件 + 數據表格
+   ================================================================ */
+function NumCell({ value, onChange, w }) {
+  return <input type="number" step="any" value={value} onChange={e => onChange(e.target.value)}
+    className={`${w || 'w-20'} px-2 py-1 border border-slate-300 rounded text-sm text-right focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 bg-white`} />;
+}
+function NameCell({ value, onChange }) {
+  return <input value={value} onChange={e => onChange(e.target.value)}
+    className="w-36 px-2 py-1 border border-slate-300 rounded text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-400" />;
+}
+function DelBtn({ onClick, title }) {
+  return <button onClick={onClick} title={title || '刪除'} className="text-slate-400 hover:text-red-600 p-1 rounded hover:bg-red-50 transition-colors"><IconTrash /></button>;
+}
+function AddBtn({ onClick }) {
+  return <button onClick={onClick} className="mt-3 inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg transition-colors"><IconPlus /> 新增研究</button>;
+}
+
+function DataTableCont({ studies, result, onEdit, onDelete, onAdd }) {
+  const rowById = {}; result.rows.forEach(r => { rowById[r.id] = r; });
+  return (
+    <div className="overflow-x-auto">
+      <table className="min-w-full text-sm">
+        <thead>
+          <tr className="text-xs text-slate-500 uppercase tracking-wide">
+            <th rowSpan="2" className="px-2 py-2 text-left align-bottom border-b-2 border-slate-300">Study</th>
+            <th colSpan="3" className="px-2 py-1 text-center text-blue-700 border-b border-slate-200">實驗組 (Experimental)</th>
+            <th colSpan="3" className="px-2 py-1 text-center text-emerald-700 border-b border-slate-200">對照組 (Control)</th>
+            <th rowSpan="2" className="px-2 py-2 text-right align-bottom border-b-2 border-slate-300">MD [95% CI]</th>
+            <th rowSpan="2" className="px-2 py-2 text-right align-bottom border-b-2 border-slate-300">Weight</th>
+            <th rowSpan="2" className="px-1 py-2 border-b-2 border-slate-300"></th>
+          </tr>
+          <tr className="text-xs text-slate-500">
+            {['N', 'Mean', 'SD', 'N', 'Mean', 'SD'].map((h, i) => <th key={i} className="px-2 py-1 text-right border-b-2 border-slate-300">{h}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {studies.map(s => {
+            const r = rowById[s.id] || {};
+            return (
+              <tr key={s.id} className={`border-b border-slate-100 ${r.ok ? '' : 'bg-red-50'}`}>
+                <td className="px-2 py-1.5"><NameCell value={s.name} onChange={v => onEdit(s.id, 'name', v)} /></td>
+                <td className="px-2 py-1.5 text-right"><NumCell w="w-14" value={s.n1} onChange={v => onEdit(s.id, 'n1', v)} /></td>
+                <td className="px-2 py-1.5 text-right"><NumCell w="w-16" value={s.m1} onChange={v => onEdit(s.id, 'm1', v)} /></td>
+                <td className="px-2 py-1.5 text-right"><NumCell w="w-14" value={s.sd1} onChange={v => onEdit(s.id, 'sd1', v)} /></td>
+                <td className="px-2 py-1.5 text-right"><NumCell w="w-14" value={s.n2} onChange={v => onEdit(s.id, 'n2', v)} /></td>
+                <td className="px-2 py-1.5 text-right"><NumCell w="w-16" value={s.m2} onChange={v => onEdit(s.id, 'm2', v)} /></td>
+                <td className="px-2 py-1.5 text-right"><NumCell w="w-14" value={s.sd2} onChange={v => onEdit(s.id, 'sd2', v)} /></td>
+                <td className="px-2 py-1.5 text-right font-mono text-xs whitespace-nowrap">{r.ok ? `${f2(r.est)} ${fmtCI(r.lo, r.hi)}` : <span className="text-red-500">數據無效</span>}</td>
+                <td className="px-2 py-1.5 text-right font-mono text-xs">{r.ok ? r.weightPct.toFixed(1) + '%' : '—'}</td>
+                <td className="px-1 py-1.5 text-center"><DelBtn onClick={() => onDelete(s.id)} title="刪除研究" /></td>
+              </tr>
+            );
+          })}
+        </tbody>
+        {result.overall && (
+          <tfoot>
+            <tr className="font-semibold text-slate-800 bg-slate-50">
+              <td className="px-2 py-2">Total ({result.k} studies)</td>
+              <td className="px-2 py-2 text-right">{result.totalN1}</td><td colSpan="2"></td>
+              <td className="px-2 py-2 text-right">{result.totalN2}</td><td colSpan="2"></td>
+              <td className="px-2 py-2 text-right font-mono text-xs whitespace-nowrap">{f2(result.overall.est)} {fmtCI(result.overall.lo, result.overall.hi)}</td>
+              <td className="px-2 py-2 text-right font-mono text-xs">100.0%</td><td></td>
+            </tr>
+          </tfoot>
+        )}
+      </table>
+      <AddBtn onClick={onAdd} />
+    </div>
+  );
+}
+
+function DataTableDich({ studies, result, measure, onEdit, onDelete, onAdd }) {
+  const info = MEASURE_INFO[measure];
+  const disp = v => (info.log ? Math.exp(v) : v);
+  const rowById = {}; result.rows.forEach(r => { rowById[r.id] = r; });
+  return (
+    <div className="overflow-x-auto">
+      <table className="min-w-full text-sm">
+        <thead>
+          <tr className="text-xs text-slate-500 uppercase tracking-wide">
+            <th rowSpan="2" className="px-2 py-2 text-left align-bottom border-b-2 border-slate-300">Study</th>
+            <th colSpan="2" className="px-2 py-1 text-center text-blue-700 border-b border-slate-200">實驗組</th>
+            <th colSpan="2" className="px-2 py-1 text-center text-emerald-700 border-b border-slate-200">對照組</th>
+            <th rowSpan="2" className="px-2 py-2 text-right align-bottom border-b-2 border-slate-300">{measure} [95% CI]</th>
+            <th rowSpan="2" className="px-2 py-2 text-right align-bottom border-b-2 border-slate-300">Weight</th>
+            <th rowSpan="2" className="px-1 py-2 border-b-2 border-slate-300"></th>
+          </tr>
+          <tr className="text-xs text-slate-500">
+            {['Events', 'Total', 'Events', 'Total'].map((h, i) => <th key={i} className="px-2 py-1 text-right border-b-2 border-slate-300">{h}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {studies.map(s => {
+            const r = rowById[s.id] || {};
+            const bg = !r.ok ? 'bg-red-50' : r.excluded ? 'bg-amber-50' : '';
+            return (
+              <tr key={s.id} className={`border-b border-slate-100 ${bg}`}>
+                <td className="px-2 py-1.5"><NameCell value={s.name} onChange={v => onEdit(s.id, 'name', v)} /></td>
+                <td className="px-2 py-1.5 text-right"><NumCell w="w-16" value={s.e1} onChange={v => onEdit(s.id, 'e1', v)} /></td>
+                <td className="px-2 py-1.5 text-right"><NumCell w="w-16" value={s.n1} onChange={v => onEdit(s.id, 'n1', v)} /></td>
+                <td className="px-2 py-1.5 text-right"><NumCell w="w-16" value={s.e2} onChange={v => onEdit(s.id, 'e2', v)} /></td>
+                <td className="px-2 py-1.5 text-right"><NumCell w="w-16" value={s.n2} onChange={v => onEdit(s.id, 'n2', v)} /></td>
+                <td className="px-2 py-1.5 text-right font-mono text-xs whitespace-nowrap">
+                  {!r.ok ? <span className="text-red-500">數據無效</span> : r.excluded ? <span className="text-amber-600">不可估計</span> : `${f2(disp(r.est))} ${fmtCI(disp(r.lo), disp(r.hi))}`}
+                </td>
+                <td className="px-2 py-1.5 text-right font-mono text-xs">{r.ok && !r.excluded ? r.weightPct.toFixed(1) + '%' : '—'}</td>
+                <td className="px-1 py-1.5 text-center"><DelBtn onClick={() => onDelete(s.id)} title="刪除研究" /></td>
+              </tr>
+            );
+          })}
+        </tbody>
+        <tfoot>
+          <tr className="font-semibold text-slate-800 bg-slate-50">
+            <td className="px-2 py-2">Total ({result.k} studies)</td>
+            <td className="px-2 py-2 text-right text-xs">{result.totalE1}</td><td className="px-2 py-2 text-right">{result.totalN1}</td>
+            <td className="px-2 py-2 text-right text-xs">{result.totalE2}</td><td className="px-2 py-2 text-right">{result.totalN2}</td>
+            <td className="px-2 py-2 text-right font-mono text-xs whitespace-nowrap">{result.overall ? `${f2(disp(result.overall.est))} ${fmtCI(disp(result.overall.lo), disp(result.overall.hi))}` : '—'}</td>
+            <td className="px-2 py-2 text-right font-mono text-xs">{result.overall ? '100.0%' : '—'}</td><td></td>
+          </tr>
+        </tfoot>
+      </table>
+      <AddBtn onClick={onAdd} />
+    </div>
+  );
+}
+
+/* ================================================================
+   9. 次組別分析卡片
+   ================================================================ */
+function CategoryManager({ categories, onAdd, onRemove }) {
+  const [text, setText] = useState('');
+  const submit = () => { const t = text.trim(); if (t) { onAdd(t); setText(''); } };
+  return (
+    <div className="flex flex-wrap items-center gap-2 mb-3">
+      <span className="text-xs font-semibold text-indigo-800">類別：</span>
+      {categories.length === 0 && <span className="text-xs text-slate-400">尚無類別（全部研究歸「未分類」）</span>}
+      {categories.map(c => (
+        <span key={c} className="inline-flex items-center gap-1 pl-2.5 pr-1.5 py-0.5 bg-white border border-indigo-200 text-indigo-700 text-sm rounded-full">
+          {c}<button onClick={() => onRemove(c)} title={`刪除類別「${c}」`} className="text-indigo-300 hover:text-red-500 rounded-full p-0.5"><IconX /></button>
+        </span>
+      ))}
+      <div className="flex items-center gap-1 ml-auto">
+        <input value={text} onChange={e => setText(e.target.value)} onKeyDown={e => e.key === 'Enter' && submit()} placeholder="新類別名稱…"
+          className="w-36 px-2.5 py-1 border border-slate-300 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400" />
+        <button onClick={submit} className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors"><IconPlus /> 新增類別</button>
+      </div>
+    </div>
+  );
+}
+
+function SubgroupCard({ analysis, studies, base, model, measure, poolFn, expLabel, ctrlLabel, onUpdate, onDelete }) {
+  const svgRef = useRef(null);
+  const info = MEASURE_INFO[measure];
+  const disp = v => (info.log ? Math.exp(v) : v);
+  const { groups, between } = useMemo(
+    () => analyzeGroups(base.included, model, poolFn, analysis.categories, analysis.assign),
+    [base, model, poolFn, analysis.categories, analysis.assign]);
+
+  const setAssign = (sid, cat) => onUpdate(analysis.id, a => ({ ...a, assign: { ...a.assign, [sid]: cat } }));
+  const addCategory = name => onUpdate(analysis.id, a => (a.categories.includes(name) || name === UNCLASSIFIED) ? a : { ...a, categories: [...a.categories, name] });
+  const removeCategory = name => onUpdate(analysis.id, a => ({ ...a, categories: a.categories.filter(c => c !== name), assign: Object.fromEntries(Object.entries(a.assign).filter(([, v]) => v !== name)) }));
+  const i2Color = i => i >= 75 ? 'text-red-600' : i >= 50 ? 'text-amber-600' : i >= 25 ? 'text-amber-500' : 'text-emerald-600';
+
+  return (
+    <section className="bg-white rounded-xl shadow-sm border border-indigo-200 p-5 mb-6">
+      <div className="flex flex-wrap items-center gap-3 mb-3">
+        <span className="w-1.5 h-5 bg-indigo-600 rounded-full inline-block"></span>
+        <input value={analysis.title} onChange={e => onUpdate(analysis.id, a => ({ ...a, title: e.target.value }))}
+          className="flex-1 min-w-40 text-base font-bold text-indigo-900 bg-transparent border-b border-transparent hover:border-indigo-200 focus:border-indigo-400 focus:outline-none px-1" />
+        <DownloadButtons svgRef={svgRef} title={analysis.title} />
+        <DelBtn onClick={() => onDelete(analysis.id)} title="刪除此 Subgroup 分析" />
+      </div>
+      <div className="bg-indigo-50/60 border border-indigo-100 rounded-lg px-4 py-3 mb-3">
+        <CategoryManager categories={analysis.categories} onAdd={addCategory} onRemove={removeCategory} />
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-6 gap-y-1.5">
+          {studies.map(s => (
+            <div key={s.id} className="flex items-center justify-between gap-2 text-sm">
+              <span className="truncate text-slate-700">{s.name}</span>
+              <select value={analysis.assign[s.id] || UNCLASSIFIED} onChange={e => setAssign(s.id, e.target.value)}
+                className="w-28 px-1.5 py-0.5 border border-slate-300 rounded text-xs bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400">
+                {[...analysis.categories, UNCLASSIFIED].map(o => <option key={o} value={o}>{o}</option>)}
+              </select>
+            </div>
+          ))}
+        </div>
+      </div>
+      <ForestPlot title={analysis.title} included={base.included} groups={groups} overall={base.overall} between={between} model={model} measure={measure} expLabel={expLabel} ctrlLabel={ctrlLabel} svgRef={svgRef} />
+      {base.overall && groups.length > 0 && (
+        <div className="mt-3 grid grid-cols-1 lg:grid-cols-3 gap-3">
+          <div className="lg:col-span-2 overflow-x-auto">
+            <table className="min-w-full text-xs border border-slate-200 rounded">
+              <thead className="bg-slate-50 text-slate-500 uppercase">
+                <tr><th className="px-2 py-1.5 text-left">Subgroup</th><th className="px-2 py-1.5 text-right">k</th><th className="px-2 py-1.5 text-right">Weight</th><th className="px-2 py-1.5 text-right">{measure} [95% CI]</th><th className="px-2 py-1.5 text-right">I²</th><th className="px-2 py-1.5 text-right">Z (p)</th></tr>
+              </thead>
+              <tbody>
+                {groups.map(g => (
+                  <tr key={g.name} className="border-t border-slate-100">
+                    <td className="px-2 py-1.5 font-medium text-indigo-700">{g.name}</td>
+                    <td className="px-2 py-1.5 text-right">{g.rows.length}</td>
+                    <td className="px-2 py-1.5 text-right font-mono">{g.weightPct.toFixed(1)}%</td>
+                    <td className="px-2 py-1.5 text-right font-mono">{f2(disp(g.pooled.est))} {fmtCI(disp(g.pooled.lo), disp(g.pooled.hi))}</td>
+                    <td className={`px-2 py-1.5 text-right font-mono font-semibold ${i2Color(g.pooled.het.i2)}`}>{g.pooled.het.df > 0 ? g.pooled.het.i2.toFixed(0) + '%' : '—'}</td>
+                    <td className="px-2 py-1.5 text-right font-mono">{Math.abs(g.pooled.z).toFixed(2)} ({fmtP(g.pooled.p).replace('P ', '')})</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className={`rounded-lg px-4 py-3 border ${between && between.p < 0.05 ? 'bg-amber-50 border-amber-200' : 'bg-slate-50 border-slate-200'}`}>
+            <div className="text-xs font-semibold text-slate-500 mb-1">組間差異檢驗</div>
+            {between ? (
+              <div className="text-sm leading-relaxed">
+                <div className="font-mono font-bold text-slate-800">Chi² = {between.Q.toFixed(2)}, df = {between.df}</div>
+                <div className={`font-mono font-bold ${between.p < 0.05 ? 'text-amber-700' : 'text-slate-700'}`}>{fmtP(between.p)}</div>
+                <div className="font-mono text-xs text-slate-500">I²(between) = {between.i2.toFixed(1)}%</div>
+                <div className={`text-xs mt-1 ${between.p < 0.05 ? 'text-amber-700 font-medium' : 'text-slate-500'}`}>{between.p < 0.05 ? '次組別間存在顯著差異' : '無足夠證據顯示組間差異'}</div>
+              </div>
+            ) : <div className="text-xs text-slate-500">需 ≥ 2 個有效次組別。</div>}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/* ================================================================
+   10. 總體統計面板
+   ================================================================ */
+function StatCard({ label, value, sub, accent }) {
+  return (
+    <div className="bg-white rounded-lg border border-slate-200 px-4 py-3">
+      <div className="text-xs text-slate-500 mb-1">{label}</div>
+      <div className={`text-xl font-bold font-mono ${accent || 'text-slate-800'}`}>{value}</div>
+      {sub && <div className="text-xs text-slate-500 mt-0.5">{sub}</div>}
+    </div>
+  );
+}
+function StatsPanel({ result, model, measure }) {
+  const { overall } = result;
+  if (!overall) return null;
+  const info = MEASURE_INFO[measure];
+  const disp = v => (info.log ? Math.exp(v) : v);
+  const het = overall.het;
+  const i2Color = het.i2 >= 75 ? 'text-red-600' : het.i2 >= 50 ? 'text-amber-600' : 'text-emerald-600';
+  const i2Note = het.i2 >= 75 ? '高度異質性' : het.i2 >= 50 ? '中度異質性' : het.i2 >= 25 ? '低度異質性' : '異質性可忽略';
+  return (
+    <div>
+      <h3 className="text-sm font-semibold text-slate-600 mb-2">總體合併效應 (Overall Pooled Effect) — {model === 'random' ? '隨機效應模型' : '固定效應模型'}{info.method === 'M-H' && (model === 'fixed' ? '（Mantel-Haenszel）' : '（DerSimonian-Laird）')}</h3>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+        <StatCard label={`Pooled ${measure}（${info.zh}）`} value={f2(disp(overall.est))} accent="text-blue-700" sub={`95% CI ${fmtCI(disp(overall.lo), disp(overall.hi))}`} />
+        <StatCard label={info.log ? 'SE (ln scale)' : 'Standard Error'} value={overall.se.toFixed(3)} />
+        <StatCard label="Z value" value={Math.abs(overall.z).toFixed(2)} />
+        <StatCard label="p value (two-sided)" value={fmtP(overall.p).replace('P ', '')} accent={overall.p < 0.05 ? 'text-blue-700' : 'text-slate-800'} sub={overall.p < 0.05 ? '達統計顯著' : '未達統計顯著'} />
+      </div>
+      <h3 className="text-sm font-semibold text-slate-600 mb-2">總體異質性 (Heterogeneity)</h3>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <StatCard label="Cochran's Q (Chi²)" value={het.Q.toFixed(2)} sub={`df = ${het.df}, ${fmtP(het.pQ)}`} />
+        <StatCard label="I²" value={het.i2.toFixed(0) + '%'} accent={i2Color} sub={i2Note} />
+        <StatCard label="Tau² (τ², DL)" value={het.tau2.toFixed(4)} sub={`研究間變異數${info.log ? ' (ln)' : ''}`} />
+        <StatCard label="Tau (τ)" value={Math.sqrt(het.tau2).toFixed(3)} sub="研究間標準差" />
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================
+   11. OUTCOME 工作區（完整數據輸入 + 森林圖 + 次組別）
+   ================================================================ */
+function OutcomeWorkspace({ outcome, update }) {
+  const { dataType, model, measure, contStudies, dichStudies, analyses } = outcome;
+  const expLabel = outcome.expLabel || 'Experimental';
+  const ctrlLabel = outcome.ctrlLabel || 'Control';
+  const overallSvgRef = useRef(null);
+  const funnelSvgRef = useRef(null);
+  const activeMeasure = dataType === 'cont' ? 'MD' : measure;
+  const studies = dataType === 'cont' ? contStudies : dichStudies;
+
+  const poolFn = useMemo(() => dataType === 'cont' ? (rs, m) => poolInvVar(rs, m) : (rs, m) => poolDich(rs, m, measure), [dataType, measure]);
+  const base = useMemo(() => {
+    const rows = dataType === 'cont' ? computeRowsCont(contStudies) : computeRowsDich(dichStudies, measure);
+    return analyzeOverall(rows, model, poolFn);
+  }, [dataType, contStudies, dichStudies, model, measure, poolFn]);
+
+  const studyKey = dataType === 'cont' ? 'contStudies' : 'dichStudies';
+  const editStudy = (id, field, value) => update(o => ({ ...o, [studyKey]: o[studyKey].map(s => s.id === id ? { ...s, [field]: value } : s) }));
+  const deleteStudy = id => update(o => ({
+    ...o, [studyKey]: o[studyKey].filter(s => s.id !== id),
+    analyses: o.analyses.map(a => { const { [id]: _d, ...rest } = a.assign; return { ...a, assign: rest }; }),
+  }));
+  const addStudy = () => update(o => {
+    const arr = o[studyKey];
+    const row = dataType === 'cont'
+      ? { id: nextId++, name: `Study ${arr.length + 1}`, n1: '50', m1: '0', sd1: '1', n2: '50', m2: '0', sd2: '1' }
+      : { id: nextId++, name: `Study ${arr.length + 1}`, e1: '10', n1: '100', e2: '10', n2: '100' };
+    return { ...o, [studyKey]: [...arr, row] };
+  });
+
+  const setDataType = v => update(o => ({ ...o, dataType: v }));
+  const setModel = v => update(o => ({ ...o, model: v }));
+  const setMeasure = v => update(o => ({ ...o, measure: v }));
+  const setExpLabel = v => update(o => ({ ...o, expLabel: v }));
+  const setCtrlLabel = v => update(o => ({ ...o, ctrlLabel: v }));
+
+  const addAnalysis = () => update(o => ({ ...o, analyses: [...o.analyses, { id: nextId++, title: `Subgroup 分析 ${o.analyses.length + 1}`, categories: [], assign: {} }] }));
+  const updateAnalysis = (aid, fn) => update(o => ({ ...o, analyses: o.analyses.map(a => a.id === aid ? fn(a) : a) }));
+  const deleteAnalysis = aid => update(o => ({ ...o, analyses: o.analyses.filter(a => a.id !== aid) }));
+
+  const Pill = ({ active, onClick, children, small }) => (
+    <button onClick={onClick} className={`${small ? 'px-3 py-1 text-xs' : 'px-4 py-2 text-sm'} font-semibold rounded-lg transition-all leading-tight ${active ? 'bg-white text-blue-700 shadow' : 'text-slate-300 hover:text-white'}`}>{children}</button>
+  );
+  const info = MEASURE_INFO[activeMeasure];
+  const overallTitle = `${outcome.name} — Overall (${info.name}, ${model === 'random' ? 'Random' : 'Fixed'})`;
+  const funnelTitle = `${outcome.name} — Funnel Plot (${info.name})`;
+
+  return (
+    <>
+      {/* 分析工具列 */}
+      <div className="bg-slate-800 rounded-xl px-5 py-3 mb-6 shadow flex flex-wrap items-center gap-3">
+        <span className="text-slate-300 text-sm font-semibold mr-1">分析設定：</span>
+        <div className="bg-slate-700/60 rounded-xl p-1 flex gap-1">
+          <Pill active={dataType === 'cont'} onClick={() => setDataType('cont')}>連續型<br/><span className="text-[10px] font-normal opacity-80">Continuous</span></Pill>
+          <Pill active={dataType === 'dich'} onClick={() => setDataType('dich')}>二分類<br/><span className="text-[10px] font-normal opacity-80">Dichotomous</span></Pill>
+        </div>
+        <div className="bg-slate-700/60 rounded-xl p-1 flex gap-1">
+          <Pill active={model === 'fixed'} onClick={() => setModel('fixed')}>固定效應<br/><span className="text-[10px] font-normal opacity-80">Fixed</span></Pill>
+          <Pill active={model === 'random'} onClick={() => setModel('random')}>隨機效應<br/><span className="text-[10px] font-normal opacity-80">Random (DL)</span></Pill>
+        </div>
+        {dataType === 'dich' && (
+          <div className="bg-slate-900 rounded-lg p-1 flex gap-1 ml-auto">
+            {['RR', 'OR', 'RD'].map(m => <Pill key={m} small active={measure === m} onClick={() => setMeasure(m)}>{m} {MEASURE_INFO[m].zh}</Pill>)}
+          </div>
+        )}
+      </div>
+
+      {/* ① 數據輸入 */}
+      <section className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+          <h2 className="text-base font-bold text-slate-700 flex items-center gap-2">
+            <span className="w-1.5 h-5 bg-blue-600 rounded-full inline-block"></span>
+            ① 研究數據輸入 ({dataType === 'cont' ? 'Continuous Data' : 'Dichotomous Data'})
+          </h2>
+          <div className="flex items-center gap-2 text-xs text-slate-500">
+            <span>組別名稱：</span>
+            <input value={expLabel} onChange={e => setExpLabel(e.target.value)} title="實驗組名稱"
+              className="w-28 px-2 py-1 border border-blue-200 rounded text-sm text-blue-700 bg-blue-50/50 focus:outline-none focus:ring-2 focus:ring-blue-400" />
+            <span className="text-slate-300">vs.</span>
+            <input value={ctrlLabel} onChange={e => setCtrlLabel(e.target.value)} title="對照組名稱"
+              className="w-28 px-2 py-1 border border-emerald-200 rounded text-sm text-emerald-700 bg-emerald-50/50 focus:outline-none focus:ring-2 focus:ring-emerald-400" />
+          </div>
+        </div>
+        {dataType === 'cont'
+          ? <DataTableCont studies={contStudies} result={base} onEdit={editStudy} onDelete={deleteStudy} onAdd={addStudy} />
+          : <DataTableDich studies={dichStudies} result={base} measure={measure} onEdit={editStudy} onDelete={deleteStudy} onAdd={addStudy} />}
+      </section>
+
+      {/* ② 主森林圖 */}
+      <section className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+          <h2 className="text-base font-bold text-slate-700 flex items-center gap-2"><span className="w-1.5 h-5 bg-blue-600 rounded-full inline-block"></span>② 主森林圖 — 所有研究 (Overall Forest Plot)</h2>
+          <DownloadButtons svgRef={overallSvgRef} title={overallTitle} />
+        </div>
+        <ForestPlot title={overallTitle} included={base.included} groups={null} overall={base.overall} between={null} model={model} measure={activeMeasure} expLabel={expLabel} ctrlLabel={ctrlLabel} svgRef={overallSvgRef} />
+      </section>
+
+      {/* ③ 總體統計 */}
+      <section className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6"><StatsPanel result={base} model={model} measure={activeMeasure} /></section>
+
+      {/* ④ 漏斗圖 */}
+      <section className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+          <h2 className="text-base font-bold text-slate-700 flex items-center gap-2"><span className="w-1.5 h-5 bg-blue-600 rounded-full inline-block"></span>④ 漏斗圖 (Funnel Plot) — 發表偏誤診斷</h2>
+          <DownloadButtons svgRef={funnelSvgRef} title={funnelTitle} />
+        </div>
+        <FunnelPlot title={funnelTitle} included={base.included} overall={base.overall} measure={activeMeasure} expLabel={expLabel} ctrlLabel={ctrlLabel} svgRef={funnelSvgRef} />
+        <p className="text-xs text-slate-400 mt-2">圓點＝各研究、中央虛線＝合併效應、灰色漏斗＝偽 95% 信賴區間（在無偏誤與無異質性下，約 95% 研究應落於漏斗內）。點分布明顯不對稱時，需留意發表偏誤或小型研究效應。</p>
+      </section>
+
+      {/* ⑤ 次組別分析 */}
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-base font-bold text-slate-700 flex items-center gap-2"><span className="w-1.5 h-5 bg-indigo-600 rounded-full inline-block"></span>⑤ Subgroup 分析（{analyses.length} 組）</h2>
+        <button onClick={addAnalysis} className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow-sm transition-colors"><IconPlus /> 新增 Subgroup 分析</button>
+      </div>
+      {analyses.length === 0 && (
+        <div className="bg-white rounded-xl border border-dashed border-slate-300 p-10 text-center text-slate-400 text-sm mb-6">尚無 Subgroup 分析 — 點右上「新增 Subgroup 分析」，為每篇研究指派類別後即自動產生分段森林圖。</div>
+      )}
+      {analyses.map(a => (
+        <SubgroupCard key={a.id} analysis={a} studies={studies} base={base} model={model} measure={activeMeasure} poolFn={poolFn} expLabel={expLabel} ctrlLabel={ctrlLabel} onUpdate={updateAnalysis} onDelete={deleteAnalysis} />
+      ))}
+    </>
+  );
+}
+
+/* ================================================================
+   12. 導航列 (Breadcrumb)
+   ================================================================ */
+function Breadcrumb({ trail }) {
+  return (
+    <nav className="flex flex-wrap items-center gap-1 text-sm mb-4">
+      {trail.map((item, i) => (
+        <React.Fragment key={i}>
+          {i > 0 && <span className="text-slate-400"><IconChevron /></span>}
+          {item.onClick ? (
+            <button onClick={item.onClick} className="text-blue-600 hover:text-blue-800 hover:underline font-medium">{item.label}</button>
+          ) : (
+            <span className="text-slate-700 font-semibold">{item.label}</span>
+          )}
+        </React.Fragment>
+      ))}
+    </nav>
+  );
+}
+
+/* ================================================================
+   13. TOPIC 列表視圖
+   ================================================================ */
+function TopicsView({ topics, onEnter, onAdd, onDelete, onRename }) {
+  const [name, setName] = useState('');
+  const submit = () => { const t = name.trim(); if (t) { onAdd(t); setName(''); } };
+  return (
+    <div>
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+        <h2 className="text-base font-bold text-slate-700 flex items-center gap-2 mb-1"><span className="w-1.5 h-5 bg-blue-600 rounded-full inline-block"></span>主題列表 (Topics)</h2>
+        <p className="text-xs text-slate-500 mb-4">一個主題（Topic）代表一個系統性回顧；建立後進入該主題可再新增多個 Outcome。</p>
+        <div className="flex items-center gap-2 mb-5">
+          <input value={name} onChange={e => setName(e.target.value)} onKeyDown={e => e.key === 'Enter' && submit()} placeholder="輸入新主題名稱，例如：降壓治療對心血管事件之影響…"
+            className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-400" />
+          <button onClick={submit} className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg shadow-sm transition-colors whitespace-nowrap"><IconPlus /> 新增主題</button>
+        </div>
+        {topics.length === 0 ? (
+          <div className="border border-dashed border-slate-300 rounded-xl p-10 text-center text-slate-400 text-sm">尚無主題 — 於上方輸入名稱並「新增主題」，建立後即可進入該主題新增 Outcome。</div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            {topics.map(t => (
+              <div key={t.id} className="group border border-slate-200 rounded-xl p-4 hover:border-blue-300 hover:shadow-sm transition-all flex items-center gap-3">
+                <div className="text-blue-500 shrink-0"><IconFolder /></div>
+                <button onClick={() => onEnter(t.id)} className="flex-1 text-left min-w-0">
+                  <div className="font-semibold text-slate-800 truncate group-hover:text-blue-700">{t.name}</div>
+                  <div className="text-xs text-slate-500 mt-0.5">{t.outcomes.length} / {MAX_OUTCOMES} Outcomes</div>
+                </button>
+                <button onClick={() => onEnter(t.id)} title="進入主題" className="text-slate-400 hover:text-blue-600 p-1"><IconChevron /></button>
+                <DelBtn onClick={() => onDelete(t.id)} title="刪除主題" />
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================
+   14. OUTCOME 列表視圖
+   ================================================================ */
+const DATATYPE_LABEL = { cont: '連續型', dich: '二分類' };
+function OutcomesView({ topic, onBack, onEnter, onAdd, onDelete, onRenameTopic }) {
+  const [name, setName] = useState('');
+  const atLimit = topic.outcomes.length >= MAX_OUTCOMES;
+  const submit = () => { const t = name.trim(); if (t && !atLimit) { onAdd(t); setName(''); } };
+  return (
+    <div>
+      <Breadcrumb trail={[{ label: '主題列表', onClick: onBack }, { label: topic.name }]} />
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+        <div className="flex items-center gap-2 mb-1">
+          <span className="w-1.5 h-5 bg-blue-600 rounded-full inline-block"></span>
+          <input value={topic.name} onChange={e => onRenameTopic(e.target.value)}
+            className="text-base font-bold text-slate-800 bg-transparent border-b border-transparent hover:border-slate-200 focus:border-blue-400 focus:outline-none px-1 flex-1" />
+        </div>
+        <p className="text-xs text-slate-500 mb-4 pl-3">
+          結果指標列表（Outcomes）· 每個主題最多 {MAX_OUTCOMES} 個 Outcome
+          <span className={`ml-1 font-semibold ${atLimit ? 'text-red-500' : 'text-slate-600'}`}>（目前 {topic.outcomes.length} / {MAX_OUTCOMES}）</span>
+        </p>
+        <div className="flex items-center gap-2 mb-5">
+          <input value={name} onChange={e => setName(e.target.value)} onKeyDown={e => e.key === 'Enter' && submit()}
+            placeholder={atLimit ? '已達 10 個 Outcome 上限' : '輸入新 Outcome 名稱，例如：收縮壓改變 (SBP, mmHg)…'} disabled={atLimit}
+            className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-400 disabled:bg-slate-100 disabled:text-slate-400" />
+          <button onClick={submit} disabled={atLimit}
+            className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg shadow-sm transition-colors whitespace-nowrap disabled:bg-slate-300 disabled:cursor-not-allowed"><IconPlus /> 新增 Outcome</button>
+        </div>
+        {atLimit && <div className="mb-4 text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">已達每個主題 {MAX_OUTCOMES} 個 Outcome 的上限，請先刪除部分 Outcome 再新增。</div>}
+        {topic.outcomes.length === 0 ? (
+          <div className="border border-dashed border-slate-300 rounded-xl p-10 text-center text-slate-400 text-sm">此主題尚無 Outcome — 於上方輸入名稱並「新增 Outcome」，建立後即進入該 Outcome 的數據輸入與森林圖分析畫面。</div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            {topic.outcomes.map((o, i) => {
+              const nStudies = (o.dataType === 'cont' ? o.contStudies : o.dichStudies).length;
+              return (
+                <div key={o.id} className="group border border-slate-200 rounded-xl p-4 hover:border-blue-300 hover:shadow-sm transition-all flex items-center gap-3">
+                  <div className="w-8 h-8 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center shrink-0 text-sm font-bold">{i + 1}</div>
+                  <button onClick={() => onEnter(o.id)} className="flex-1 text-left min-w-0">
+                    <div className="font-semibold text-slate-800 truncate group-hover:text-blue-700">{o.name}</div>
+                    <div className="text-xs text-slate-500 mt-0.5 flex items-center gap-2">
+                      <span className="inline-block px-1.5 py-0.5 rounded bg-slate-100">{DATATYPE_LABEL[o.dataType]}</span>
+                      {nStudies} 篇研究 · {o.analyses.length} 個 Subgroup 分析
+                    </div>
+                  </button>
+                  <button onClick={() => onEnter(o.id)} title="進入 Outcome 分析" className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-lg"><IconChart /> 分析</button>
+                  <DelBtn onClick={() => onDelete(o.id)} title="刪除 Outcome" />
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================
+   15. OUTCOME 分析視圖
+   ================================================================ */
+function AnalysisView({ topic, outcome, onBackTopics, onBackOutcomes, onRenameOutcome, update }) {
+  return (
+    <div>
+      <Breadcrumb trail={[{ label: '主題列表', onClick: onBackTopics }, { label: topic.name, onClick: onBackOutcomes }, { label: outcome.name }]} />
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4 mb-6 flex items-center gap-3">
+        <button onClick={onBackOutcomes} className="inline-flex items-center gap-1 text-sm text-slate-500 hover:text-blue-600 shrink-0"><IconBack /> Outcomes</button>
+        <span className="w-1.5 h-6 bg-blue-600 rounded-full inline-block shrink-0"></span>
+        <div className="min-w-0 flex-1">
+          <div className="text-[11px] text-slate-400 uppercase tracking-wide">Outcome</div>
+          <input value={outcome.name} onChange={e => onRenameOutcome(e.target.value)}
+            className="w-full text-lg font-bold text-slate-800 bg-transparent border-b border-transparent hover:border-slate-200 focus:border-blue-400 focus:outline-none" />
+        </div>
+      </div>
+      <OutcomeWorkspace outcome={outcome} update={update} />
+    </div>
+  );
+}
+
+/* ================================================================
+   16. 主應用程式 — 導航 + 資料階層
+   ================================================================ */
+let nextId = 1000;
+
+function makeContStudy(name, n1, m1, sd1, n2, m2, sd2) { return { id: nextId++, name, n1, m1, sd1, n2, m2, sd2 }; }
+function newOutcome(name) {
+  return {
+    id: nextId++, name: name || '未命名 Outcome', dataType: 'cont', model: 'random', measure: 'RR',
+    contStudies: [
+      makeContStudy('Study 1', '60', '-2.4', '5.2', '58', '-0.5', '5.6'),
+      makeContStudy('Study 2', '45', '-1.8', '6.1', '47', '-0.2', '5.8'),
+      makeContStudy('Study 3', '80', '-2.9', '5.0', '82', '-0.8', '5.3'),
+    ],
+    dichStudies: [
+      { id: nextId++, name: 'Study 1', e1: '12', n1: '120', e2: '20', n2: '118' },
+      { id: nextId++, name: 'Study 2', e1: '8', n1: '90', e2: '14', n2: '92' },
+      { id: nextId++, name: 'Study 3', e1: '15', n1: '150', e2: '25', n2: '148' },
+    ],
+    analyses: [],
+  };
+}
+
+// 預設示範主題：一個 Topic，內含一個已填好資料的 Outcome
+const DEMO_TOPIC = (() => {
+  const contStudies = [
+    { id: nextId++, name: 'Chen 2015', n1: '60', m1: '-12.4', sd1: '5.2', n2: '58', m2: '-8.1', sd2: '5.6' },
+    { id: nextId++, name: 'Kumar 2016', n1: '45', m1: '-10.2', sd1: '6.1', n2: '47', m2: '-7.9', sd2: '5.8' },
+    { id: nextId++, name: 'Lee 2017', n1: '80', m1: '-11.0', sd1: '5.0', n2: '82', m2: '-8.0', sd2: '5.3' },
+    { id: nextId++, name: 'Tanaka 2018', n1: '38', m1: '-13.5', sd1: '7.2', n2: '40', m2: '-8.8', sd2: '6.9' },
+    { id: nextId++, name: 'Wong 2018', n1: '55', m1: '-9.8', sd1: '4.7', n2: '53', m2: '-7.1', sd2: '4.9' },
+    { id: nextId++, name: 'Park 2019', n1: '70', m1: '-12.1', sd1: '5.5', n2: '68', m2: '-8.6', sd2: '5.8' },
+    { id: nextId++, name: 'Singh 2020', n1: '42', m1: '-10.5', sd1: '6.0', n2: '44', m2: '-7.7', sd2: '6.2' },
+    { id: nextId++, name: 'Zhao 2021', n1: '95', m1: '-11.6', sd1: '4.8', n2: '93', m2: '-8.9', sd2: '5.0' },
+    { id: nextId++, name: 'Müller 2015', n1: '50', m1: '-9.0', sd1: '5.4', n2: '52', m2: '-7.5', sd2: '5.6' },
+    { id: nextId++, name: 'Rossi 2016', n1: '65', m1: '-10.3', sd1: '5.1', n2: '63', m2: '-8.4', sd2: '5.3' },
+    { id: nextId++, name: 'Novak 2017', n1: '48', m1: '-8.7', sd1: '6.3', n2: '46', m2: '-6.9', sd2: '6.0' },
+    { id: nextId++, name: 'García 2018', n1: '88', m1: '-9.9', sd1: '4.9', n2: '90', m2: '-8.1', sd2: '5.2' },
+    { id: nextId++, name: 'Schmidt 2019', n1: '40', m1: '-11.2', sd1: '6.8', n2: '42', m2: '-8.3', sd2: '6.5' },
+    { id: nextId++, name: 'Dubois 2020', n1: '58', m1: '-8.5', sd1: '5.0', n2: '60', m2: '-7.0', sd2: '5.2' },
+    { id: nextId++, name: 'Andersson 2021', n1: '72', m1: '-10.0', sd1: '5.3', n2: '70', m2: '-8.2', sd2: '5.4' },
+  ];
+  const ids = contStudies.map(s => s.id);
+  const region = {}, era = {};
+  ids.forEach((id, i) => { region[id] = i < 8 ? '亞洲' : '歐洲'; era[id] = i < 3 || (i >= 8 && i < 11) ? '2017 以前' : '2018 以後'; });
+  const outcome = {
+    id: nextId++, name: '收縮壓改變 (SBP, mmHg)', dataType: 'cont', model: 'random', measure: 'RR',
+    contStudies,
+    dichStudies: [
+      { id: nextId++, name: 'Ashton 1997', e1: '12', n1: '150', e2: '24', n2: '148' },
+      { id: nextId++, name: 'Berry 2001', e1: '8', n1: '95', e2: '15', n2: '90' },
+    ],
+    analyses: [
+      { id: nextId++, title: 'Subgroup 分析 1：地區 (Region)', categories: ['亞洲', '歐洲'], assign: region },
+      { id: nextId++, title: 'Subgroup 分析 2：發表年代 (Year)', categories: ['2017 以前', '2018 以後'], assign: era },
+    ],
+  };
+  return { id: nextId++, name: '範例主題：降壓治療對血壓之影響', outcomes: [outcome] };
+})();
+
+function App() {
+  const [topics, setTopics] = useState([DEMO_TOPIC]);
+  const [nav, setNav] = useState({ view: 'topics', topicId: null, outcomeId: null });
+
+  const currentTopic = topics.find(t => t.id === nav.topicId) || null;
+  const currentOutcome = currentTopic ? currentTopic.outcomes.find(o => o.id === nav.outcomeId) || null : null;
+
+  // Topic 操作
+  const addTopic = name => { const id = nextId++; setTopics(prev => [...prev, { id, name, outcomes: [] }]); setNav({ view: 'outcomes', topicId: id, outcomeId: null }); };
+  const deleteTopic = id => setTopics(prev => prev.filter(t => t.id !== id));
+  const renameTopic = (id, name) => setTopics(prev => prev.map(t => t.id === id ? { ...t, name } : t));
+
+  // Outcome 操作
+  const addOutcome = (topicId, name) => {
+    const o = newOutcome(name);
+    setTopics(prev => prev.map(t => (t.id === topicId && t.outcomes.length < MAX_OUTCOMES) ? { ...t, outcomes: [...t.outcomes, o] } : t));
+    setNav({ view: 'analysis', topicId, outcomeId: o.id });
+  };
+  const deleteOutcome = (topicId, oid) => setTopics(prev => prev.map(t => t.id === topicId ? { ...t, outcomes: t.outcomes.filter(o => o.id !== oid) } : t));
+  const renameOutcome = name => setTopics(prev => prev.map(t => t.id !== nav.topicId ? t : { ...t, outcomes: t.outcomes.map(o => o.id === nav.outcomeId ? { ...o, name } : o) }));
+  const updateOutcome = fn => setTopics(prev => prev.map(t => t.id !== nav.topicId ? t : { ...t, outcomes: t.outcomes.map(o => o.id === nav.outcomeId ? fn(o) : o) }));
+
+  const goTopics = () => setNav({ view: 'topics', topicId: null, outcomeId: null });
+  const goOutcomes = tid => setNav({ view: 'outcomes', topicId: tid, outcomeId: null });
+  const goAnalysis = oid => setNav({ view: 'analysis', topicId: nav.topicId, outcomeId: oid });
+
+  // 導航防呆：目標不存在時回退
+  let view = nav.view;
+  if (view !== 'topics' && !currentTopic) view = 'topics';
+  else if (view === 'analysis' && !currentOutcome) view = 'outcomes';
+
+  return (
+    <div className="max-w-6xl mx-auto px-4 py-6">
+      <header className="bg-slate-800 rounded-xl px-6 py-5 mb-6 shadow-lg">
+        <h1 className="text-white text-xl font-bold tracking-tight">
+          MARS <span className="text-blue-400">Web</span>
+          <span className="ml-2 text-xs font-normal text-slate-400 align-middle">Meta Automated Review System · Topics → Outcomes → Meta-Analysis</span>
+        </h1>
+        <p className="text-slate-400 text-xs mt-1">建立主題 (Topic) → 進入後新增結果指標 (Outcome，每主題上限 10 個) → 每個 Outcome 各自進行數據輸入、森林圖與次組別分析</p>
+      </header>
+
+      {view === 'topics' && (
+        <TopicsView topics={topics} onEnter={goOutcomes} onAdd={addTopic} onDelete={deleteTopic} onRename={renameTopic} />
+      )}
+      {view === 'outcomes' && currentTopic && (
+        <OutcomesView topic={currentTopic} onBack={goTopics} onEnter={goAnalysis}
+          onAdd={name => addOutcome(currentTopic.id, name)} onDelete={oid => deleteOutcome(currentTopic.id, oid)}
+          onRenameTopic={name => renameTopic(currentTopic.id, name)} />
+      )}
+      {view === 'analysis' && currentTopic && currentOutcome && (
+        <AnalysisView topic={currentTopic} outcome={currentOutcome} onBackTopics={goTopics}
+          onBackOutcomes={() => goOutcomes(currentTopic.id)} onRenameOutcome={renameOutcome} update={updateOutcome} />
+      )}
+
+      <footer className="text-center text-xs text-slate-400 pb-4 leading-relaxed mt-2">
+        僅供教學與原型展示用途 · 95% CI 採常態近似 (z = 1.96) · τ² 採 DerSimonian-Laird 動差估計 · 二分類固定效應採 Mantel-Haenszel<br/>
+        資料儲存在瀏覽器記憶體中，重新整理頁面將回復為預設示範資料
+      </footer>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

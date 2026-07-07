@@ -1,0 +1,11 @@
+# 本機開發工具設定（Claude Code 預覽伺服器）
+.claude/
+
+# OS / 編輯器雜項
+.DS_Store
+Thumbs.db
+*.log
+node_modules/
+
+# Netlify 本機部署狀態
+.netlify/
