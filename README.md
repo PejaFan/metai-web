@@ -4,7 +4,7 @@
 
 致敬 Cochrane RevMan 的網頁版 **統合分析（Meta-analysis）** 原型，純前端單一 HTML 檔（React + Tailwind CDN），雙擊即可在瀏覽器執行。更直覺、更親民的操作方式!!
 
-線上展示：https://mars-review.netlify.app
+線上展示：https://met-ai-web.netlify.app
 
 ## 功能
 
