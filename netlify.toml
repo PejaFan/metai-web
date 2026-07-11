@@ -1,0 +1,4 @@
+# Netlify 建置設定 — MetAI Web 為純靜態單一 HTML，無需 build
+[build]
+  command = "echo 'No build step — static site'"
+  publish = "."
