@@ -1,6 +1,6 @@
 # MetAI Web — Meta-Analysis 統合分析平台
-
-> 設計者：**PejaFan**
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22851886.svg)](https://doi.org/10.5281/zenodo.22851886)
+> 設計者：**Chia-Hao (Peja) Fan, Heng-Hsin Tung**
 
 致敬 Cochrane RevMan 的網頁版 **統合分析（Meta-analysis）** 原型，純前端單一 HTML 檔（React + Tailwind CDN），雙擊即可在瀏覽器執行。更直覺、更親民的操作方式!!
 
