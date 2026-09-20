@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Fan"
+    given-names: "Chia-Hao"
+    orcid: "https://orcid.org/0000-0001-6801-5274"
+    affiliation: "Department of Nursing, Hualien Tzu Chi Hospital"
+  - family-names: "Tung"
+    given-names: "Heng-Hsin"
+    affiliation: "College of Nursing, National Yang Ming Chiao Tung University"
+title: "metai-web: A Cochrane-aligned web application for meta-analysis"
+version: 1.0.0
+date-released: 2026-03-20
+url: "https://github.com/PejaFan/metai-web"
