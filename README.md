@@ -1,4 +1,4 @@
-# MetAI Web — Meta-Analysis 統合分析平台
+# METAi Web — Meta-Analysis 統合分析平台
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22851886.svg)](https://doi.org/10.5281/zenodo.22851886)
 > 設計者：**Chia-Hao (Peja) Fan, Heng-Hsin Tung**
 
